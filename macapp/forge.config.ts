@@ -6,9 +6,13 @@ import { AutoUnpackNativesPlugin } from '@electron-forge/plugin-auto-unpack-nati
 import { WebpackPlugin } from '@electron-forge/plugin-webpack'
 import * as path from 'path'
 import * as fs from 'fs'
+import { fileURLToPath } from 'url'
 
-import { mainConfig } from './webpack.main.config'
-import { rendererConfig } from './webpack.renderer.config'
+import { mainConfig } from './webpack.main.config.ts'
+import { rendererConfig } from './webpack.renderer.config.ts'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, './package.json'), 'utf8'))
 
