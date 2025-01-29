@@ -29,7 +29,7 @@ const logger = winston.createLogger({
       maxFiles: 5,
     }),
   ],
-  format: winston.format.printf(info => info.message),
+  format: winston.format.printf((info: winston.Logform.TransformableInfo) => info.message as string),
 })
 
 app.on('ready', () => {
