@@ -11,19 +11,20 @@ const rendererConfig = require('./webpack.renderer.config');
 
 module.exports = {
   packagerConfig: {
+    name: 'Ollama',
     appVersion: process.env.VERSION || packageJson.version,
     asar: true,
-    icon: './assets/icon.icns',
+    icon: './assets/icon',
     extraResource: [
-      '../dist/ollama',
-      path.join(__dirname, './assets/iconTemplate.png'),
-      path.join(__dirname, './assets/iconTemplate@2x.png'),
-      path.join(__dirname, './assets/iconUpdateTemplate.png'),
-      path.join(__dirname, './assets/iconUpdateTemplate@2x.png'),
-      path.join(__dirname, './assets/iconDarkTemplate.png'),
-      path.join(__dirname, './assets/iconDarkTemplate@2x.png'),
+      '/Users/davec/Nextcloud/Work/ollama/ollama',
     ],
+    x64ArchFiles: "Contents/Resources/ollama",
+    osxUniversal: {
+      x64ArchFiles: "Contents/Resources/ollama",
+      mergeASARs: true
+    }
   },
+  rebuildConfig: {},
   plugins: [
     new AutoUnpackNativesPlugin({}),
     new WebpackPlugin({
@@ -44,12 +45,6 @@ module.exports = {
     }),
   ],
   makers: [
-    {
-      name: '@electron-forge/maker-squirrel',
-      config: {
-        name: 'ollama',
-      },
-    },
     {
       name: '@electron-forge/maker-zip',
       platforms: ['darwin'],
