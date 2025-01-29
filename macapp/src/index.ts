@@ -33,7 +33,7 @@ const logger = winston.createLogger({
   format: winston.format.printf((info: winston.Logform.TransformableInfo) => info.message as string),
 })
 
-app.on('ready', () => {
+app.on('ready', async () => {
   const gotTheLock = app.requestSingleInstanceLock()
   if (!gotTheLock) {
     app.exit(0)
@@ -41,20 +41,24 @@ app.on('ready', () => {
   }
 
   app.on('second-instance', () => {
-    if (app.hasSingleInstanceLock()) {
-      app.releaseSingleInstanceLock()
-    }
-
     if (proc) {
       proc.off('exit', restart)
       proc.kill()
     }
-
     app.exit(0)
   })
 
-  app.focus({ steal: true })
+  // Initialize server first
+  try {
+    server()
+  } catch (error) {
+    logger.error(`Failed to start server during initialization: ${error.message}`)
+    dialog.showErrorBox('Server Error', `Failed to start Ollama server: ${error.message}`)
+    app.exit(1)
+    return
+  }
 
+  app.focus({ steal: true })
   init()
 })
 
@@ -142,21 +146,28 @@ function server() {
   logger.info(`Starting ollama server with binary: ${binary}`)
   logger.info(`Current working directory: ${process.cwd()}`)
 
+  // Verify binary exists
+  if (!fs.existsSync(binary)) {
+    throw new Error(`Ollama binary not found at ${binary}`)
+  }
+
   // Ensure the .ollama directory exists with proper permissions
   const ollamaDir = path.join(app.getPath('home'), '.ollama')
   const modelsDir = path.join(ollamaDir, 'models')
+  const logsDir = path.join(ollamaDir, 'logs')
 
   try {
-    if (!fs.existsSync(ollamaDir)) {
-      fs.mkdirSync(ollamaDir, { recursive: true, mode: 0o755 })
-    }
-    
-    // Just ensure models directory has correct permissions
-    if (fs.existsSync(modelsDir)) {
-      fs.chmodSync(modelsDir, 0o755)
+    // Create all necessary directories
+    for (const dir of [ollamaDir, modelsDir, logsDir]) {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o755 })
+      } else {
+        fs.chmodSync(dir, 0o755)
+      }
     }
   } catch (error) {
     logger.error(`Failed to setup ollama directories: ${error.message}`)
+    throw error
   }
 
   // Set environment variables
@@ -171,58 +182,55 @@ function server() {
 
   logger.info(`Environment variables: ${JSON.stringify(env, null, 2)}`)
 
+  // Ensure the binary is executable
   try {
-    // Ensure the binary is executable
-    try {
-      fs.chmodSync(binary, 0o755)
-    } catch (error) {
-      logger.error(`Failed to set binary permissions: ${error.message}`)
-    }
-
-    proc = spawn(binary, ['serve'], { 
-      env,
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-
-    if (!proc.pid) {
-      throw new Error('Failed to start server process')
-    }
-
-    logger.info(`Server process started with PID: ${proc.pid}`)
-
-    proc.stdout.on('data', data => {
-      logger.info(`[stdout] ${data.toString().trim()}`)
-    })
-
-    proc.stderr.on('data', data => {
-      logger.error(`[stderr] ${data.toString().trim()}`)
-    })
-
-    proc.on('error', (err) => {
-      logger.error(`Failed to start server: ${err.message}`)
-      if (err.message.includes('EACCES')) {
-        logger.error('Permission denied. Please check file permissions.')
-      }
-    })
-
-    proc.on('exit', (code, signal) => {
-      logger.info(`Server process exited with code ${code} and signal ${signal}`)
-      // Only restart if it wasn't intentionally killed
-      if (signal !== 'SIGTERM' && signal !== 'SIGINT') {
-        restart()
-      }
-    })
-
-    // Add a cleanup handler
-    process.on('exit', () => {
-      if (proc) {
-        proc.kill()
-      }
-    })
+    fs.chmodSync(binary, 0o755)
   } catch (error) {
-    logger.error(`Exception while starting server: ${error.message}`)
+    logger.error(`Failed to set binary permissions: ${error.message}`)
     throw error
   }
+
+  proc = spawn(binary, ['serve'], { 
+    env,
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+
+  if (!proc.pid) {
+    throw new Error('Failed to start server process')
+  }
+
+  logger.info(`Server process started with PID: ${proc.pid}`)
+
+  proc.stdout.on('data', data => {
+    logger.info(`[stdout] ${data.toString().trim()}`)
+  })
+
+  proc.stderr.on('data', data => {
+    logger.error(`[stderr] ${data.toString().trim()}`)
+  })
+
+  proc.on('error', (err) => {
+    logger.error(`Failed to start server: ${err.message}`)
+    if (err.message.includes('EACCES')) {
+      logger.error('Permission denied. Please check file permissions.')
+      throw err
+    }
+  })
+
+  proc.on('exit', (code, signal) => {
+    logger.info(`Server process exited with code ${code} and signal ${signal}`)
+    if (code !== 0 && signal !== 'SIGTERM' && signal !== 'SIGINT') {
+      logger.error('Server exited unexpectedly')
+      restart()
+    }
+  })
+
+  // Add a cleanup handler
+  process.on('exit', () => {
+    if (proc) {
+      proc.kill('SIGINT')
+    }
+  })
 }
 
 function restart() {
@@ -325,8 +333,6 @@ function init() {
       }
     }
   }
-
-  server()
 
   if (store.get('first-time-run') && installed()) {
     if (process.platform === 'darwin') {
