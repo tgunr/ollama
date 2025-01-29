@@ -18,13 +18,31 @@ module.exports = {
     extraResource: [
       path.resolve(__dirname, '../ollama')
     ],
-    x64ArchFiles: "Contents/Resources/ollama",
-    osxUniversal: {
-      x64ArchFiles: "Contents/Resources/ollama",
-      mergeASARs: true
-    }
+    osxSign: {
+      entitlements: 'entitlements.plist',
+      'entitlements-inherit': 'entitlements.plist',
+      'gatekeeper-assess': false,
+      hardenedRuntime: true,
+    },
+    arch: 'arm64',
+    platform: 'darwin',
+    protocols: [
+      {
+        name: 'Ollama Protocol',
+        schemes: ['ollama']
+      }
+    ]
   },
   rebuildConfig: {},
+  makers: [
+    {
+      name: '@electron-forge/maker-zip',
+      platforms: ['darwin'],
+      config: {
+        arch: 'arm64'
+      }
+    }
+  ],
   plugins: [
     new AutoUnpackNativesPlugin({}),
     new WebpackPlugin({
@@ -37,18 +55,12 @@ module.exports = {
             js: './src/renderer.tsx',
             name: 'main_window',
             preload: {
-              js: './src/preload.ts',
-            },
-          },
-        ],
-      },
-    }),
-  ],
-  makers: [
-    {
-      name: '@electron-forge/maker-zip',
-      platforms: ['darwin'],
-    },
+              js: './src/preload.ts'
+            }
+          }
+        ]
+      }
+    })
   ],
   publishers: [
     {

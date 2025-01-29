@@ -4,6 +4,7 @@ import Store from 'electron-store'
 import winston from 'winston'
 import 'winston-daily-rotate-file'
 import * as path from 'path'
+import * as fs from 'fs'
 
 import { v4 as uuidv4 } from 'uuid'
 import { installed } from './install'
@@ -138,17 +139,90 @@ function server() {
     ? path.join(process.resourcesPath, 'ollama')
     : path.resolve(process.cwd(), '..', 'ollama')
 
-  proc = spawn(binary, ['serve'])
+  logger.info(`Starting ollama server with binary: ${binary}`)
+  logger.info(`Current working directory: ${process.cwd()}`)
 
-  proc.stdout.on('data', data => {
-    logger.info(data.toString().trim())
-  })
+  // Ensure the .ollama directory exists with proper permissions
+  const ollamaDir = path.join(app.getPath('home'), '.ollama')
+  const modelsDir = path.join(ollamaDir, 'models')
 
-  proc.stderr.on('data', data => {
-    logger.error(data.toString().trim())
-  })
+  try {
+    if (!fs.existsSync(ollamaDir)) {
+      fs.mkdirSync(ollamaDir, { recursive: true, mode: 0o755 })
+    }
+    
+    // Just ensure models directory has correct permissions
+    if (fs.existsSync(modelsDir)) {
+      fs.chmodSync(modelsDir, 0o755)
+    }
+  } catch (error) {
+    logger.error(`Failed to setup ollama directories: ${error.message}`)
+  }
 
-  proc.on('exit', restart)
+  // Set environment variables
+  const env = {
+    ...process.env,
+    OLLAMA_MODELS: modelsDir,
+    OLLAMA_ORIGINS: '*',
+    OLLAMA_HOST: 'http://127.0.0.1:11434',
+    PATH: process.env.PATH,
+    HOME: app.getPath('home')
+  }
+
+  logger.info(`Environment variables: ${JSON.stringify(env, null, 2)}`)
+
+  try {
+    // Ensure the binary is executable
+    try {
+      fs.chmodSync(binary, 0o755)
+    } catch (error) {
+      logger.error(`Failed to set binary permissions: ${error.message}`)
+    }
+
+    proc = spawn(binary, ['serve'], { 
+      env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+
+    if (!proc.pid) {
+      throw new Error('Failed to start server process')
+    }
+
+    logger.info(`Server process started with PID: ${proc.pid}`)
+
+    proc.stdout.on('data', data => {
+      logger.info(`[stdout] ${data.toString().trim()}`)
+    })
+
+    proc.stderr.on('data', data => {
+      logger.error(`[stderr] ${data.toString().trim()}`)
+    })
+
+    proc.on('error', (err) => {
+      logger.error(`Failed to start server: ${err.message}`)
+      if (err.message.includes('EACCES')) {
+        logger.error('Permission denied. Please check file permissions.')
+      }
+    })
+
+    proc.on('exit', (code, signal) => {
+      logger.info(`Server process exited with code ${code} and signal ${signal}`)
+      // Only restart if it wasn't intentionally killed
+      if (signal !== 'SIGTERM' && signal !== 'SIGINT') {
+        restart()
+      }
+    })
+
+    // Add a cleanup handler
+    process.on('exit', () => {
+      if (proc) {
+        proc.kill()
+      }
+    })
+  } catch (error) {
+    logger.error(`Exception while starting server: ${error.message}`)
+    throw error
+  }
 }
 
 function restart() {
