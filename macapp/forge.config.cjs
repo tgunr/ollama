@@ -16,7 +16,7 @@ module.exports = {
     asar: true,
     icon: './assets/icon',
     extraResource: [
-      '/Users/davec/Nextcloud/Work/ollama/ollama',
+      path.resolve(__dirname, '../ollama')
     ],
     x64ArchFiles: "Contents/Resources/ollama",
     osxUniversal: {
