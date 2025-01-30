@@ -1,10 +1,11 @@
-import { spawn, ChildProcess } from 'child_process'
-import { app, autoUpdater, dialog, Tray, Menu, BrowserWindow, MenuItemConstructorOptions, nativeTheme, shell, nativeImage } from 'electron'
+import { spawn, ChildProcess, spawnSync } from 'child_process'
+import { app, autoUpdater, dialog, Tray, Menu, BrowserWindow, MenuItemConstructorOptions, MenuItem, nativeTheme, shell, nativeImage } from 'electron'
 import Store from 'electron-store'
 import winston from 'winston'
 import 'winston-daily-rotate-file'
 import * as path from 'path'
 import * as fs from 'fs'
+import * as net from 'net'
 
 import { v4 as uuidv4 } from 'uuid'
 import { installed } from './install'
@@ -15,7 +16,11 @@ if (require('electron-squirrel-startup')) {
   app.quit()
 }
 
-const store = new Store()
+const store = new Store({
+  defaults: {
+    listenAllInterfaces: false, // Default to localhost only for security
+  }
+})
 
 let welcomeWindow: BrowserWindow | null = null
 
@@ -46,6 +51,16 @@ function createMenu() {
             {
               label: 'Check for Updates',
               click: () => checkUpdate()
+            },
+            { type: 'separator' as const },
+            {
+              label: 'Listen on All Interfaces',
+              type: 'checkbox' as const,
+              checked: store.get('listenAllInterfaces') as boolean,
+              click: async (menuItem: MenuItem) => {
+                store.set('listenAllInterfaces', menuItem.checked)
+                await restart()
+              }
             },
             { type: 'separator' as const },
             { role: 'services' as const },
@@ -287,48 +302,187 @@ function updateTrayMenu() {
 
 let proc: ChildProcess = null
 
+async function killExistingProcesses(): Promise<void> {
+  // Try normal kill first
+  try {
+    const portCheck = spawnSync('lsof', ['-i', ':11434'], { encoding: 'utf8' })
+    if (portCheck.status === 0 && portCheck.stdout) {
+      const pids = portCheck.stdout
+        .split('\n')
+        .slice(1)
+        .filter(line => line.trim())
+        .map(line => line.trim().split(/\s+/)[1])
+        .filter(Boolean)
+
+      if (pids.length > 0) {
+        logger.info('Found existing Ollama processes:', pids)
+        
+        // Try normal kill first
+        const killResult = spawnSync('kill', pids, { encoding: 'utf8' })
+        if (killResult.status !== 0) {
+          // If normal kill fails, try force kill with sudo
+          logger.info('Normal kill failed, trying sudo force kill')
+          const sudoKill = spawnSync('sudo', ['kill', '-9', ...pids], { encoding: 'utf8' })
+          if (sudoKill.status === 0) {
+            logger.info('Successfully force killed processes')
+          } else {
+            logger.error('Failed to kill processes:', sudoKill.stderr)
+            throw new Error('Failed to kill existing processes')
+          }
+        }
+        
+        // Wait for processes to clean up
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
+    }
+  } catch (error) {
+    logger.error('Error killing existing processes:', error)
+    throw error
+  }
+}
+
+async function waitForPort(port: number, host: string = '0.0.0.0', timeout: number = 15000): Promise<boolean> {
+  const start = Date.now()
+  
+  while (Date.now() - start < timeout) {
+    try {
+      const socket = new net.Socket()
+      
+      const connected = await new Promise<boolean>((resolve) => {
+        socket.once('connect', () => {
+          socket.end()
+          resolve(true)
+        })
+        
+        socket.once('error', () => {
+          socket.destroy()
+          resolve(false)
+        })
+        
+        socket.connect(port, host)
+      })
+      
+      if (connected) {
+        return true
+      }
+    } catch (error) {
+      // Ignore errors and keep trying
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  
+  return false
+}
+
+async function setupModelDirectory(): Promise<string> {
+  const ollamaDir = path.join(app.getPath('home'), '.ollama')
+  const modelsDir = path.join(ollamaDir, 'models')
+  const externalModelsDir = '/Volumes/ai/ollama/.ollama/models'
+
+  try {
+    // Create .ollama directory if it doesn't exist
+    if (!fs.existsSync(ollamaDir)) {
+      fs.mkdirSync(ollamaDir, { recursive: true })
+      logger.info('Created .ollama directory')
+    }
+
+    // Check if external models directory exists and is accessible
+    if (fs.existsSync(externalModelsDir)) {
+      logger.info('Found external models directory')
+      
+      // If models directory exists, check if it's already the correct symlink
+      if (fs.existsSync(modelsDir)) {
+        const stats = fs.lstatSync(modelsDir)
+        if (stats.isSymbolicLink()) {
+          const target = fs.readlinkSync(modelsDir)
+          if (target === externalModelsDir) {
+            logger.info('Models directory already correctly symlinked')
+            return externalModelsDir
+          }
+          // Wrong symlink, remove it
+          fs.unlinkSync(modelsDir)
+          logger.info('Removed incorrect models symlink')
+        } else {
+          // Regular directory, move it as backup
+          const backupDir = `${modelsDir}.bak.${Date.now()}`
+          fs.renameSync(modelsDir, backupDir)
+          logger.info(`Backed up existing models directory to ${backupDir}`)
+        }
+      }
+      
+      // Create symlink to external models
+      fs.symlinkSync(externalModelsDir, modelsDir)
+      logger.info('Created symlink to external models directory')
+      return externalModelsDir
+    } else {
+      logger.info('External models directory not found, using local directory')
+      
+      // Use local models directory
+      if (!fs.existsSync(modelsDir)) {
+        fs.mkdirSync(modelsDir, { recursive: true })
+        fs.mkdirSync(path.join(modelsDir, 'blobs'), { recursive: true })
+        fs.mkdirSync(path.join(modelsDir, 'manifests'), { recursive: true })
+        logger.info('Created local models directory structure')
+      }
+      return modelsDir
+    }
+  } catch (error) {
+    logger.error('Error setting up models directory:', error)
+    throw error
+  }
+}
+
 async function startServer(): Promise<ChildProcess> {
   logger.info('Starting server initialization')
   
-  // Ensure ollama directories exist
-  const ollamaDir = path.join(app.getPath('home'), '.ollama')
-  const modelsDir = path.join(ollamaDir, 'models')
+  // Set up models directory
+  const modelsPath = await setupModelDirectory()
+  logger.info(`Using models directory: ${modelsPath}`)
   
+  // Kill any existing processes
   try {
-    if (!fs.existsSync(ollamaDir)) {
-      fs.mkdirSync(ollamaDir, { recursive: true, mode: 0o755 })
-    }
-    if (!fs.existsSync(modelsDir)) {
-      fs.mkdirSync(modelsDir, { recursive: true, mode: 0o755 })
+    const portCheck = spawnSync('lsof', ['-i', ':11434'], { encoding: 'utf8' })
+    if (portCheck.status === 0 && portCheck.stdout) {
+      const pids = portCheck.stdout
+        .split('\n')
+        .slice(1)
+        .filter(line => line.trim())
+        .map(line => line.trim().split(/\s+/)[1])
+        .filter(Boolean)
+
+      if (pids.length > 0) {
+        logger.info('Found existing Ollama processes:', pids)
+        spawnSync('sudo', ['kill', '-9', ...pids], { encoding: 'utf8' })
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      }
     }
   } catch (error) {
-    logger.error('Failed to create ollama directories:', error)
-    throw error
+    logger.error('Error killing existing processes:', error)
   }
-
+  
   const env = { ...process.env }
-  env.OLLAMA_MODELS = modelsDir
+  env.OLLAMA_MODELS = modelsPath
   env.OLLAMA_ORIGINS = '*'
-  env.OLLAMA_HOST = 'http://127.0.0.1:11434'
+  env.OLLAMA_HOST = 'http://0.0.0.0:11434'
   env.PATH = process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
   env.HOME = app.getPath('home')
+  env.OLLAMA_DEBUG = 'true'
+  env.RUST_LOG = 'debug'
+  env.RUST_BACKTRACE = '1'
 
   const binary = app.isPackaged
     ? path.join(process.resourcesPath, 'ollama')
     : path.resolve(process.cwd(), '..', 'ollama')
 
   logger.info(`Starting ollama server with binary: ${binary}`)
-  logger.info(`Current working directory: ${process.cwd()}`)
   logger.info('Starting server with environment:', JSON.stringify(env, null, 2))
 
-  // Ensure binary exists
+  // Ensure binary exists and is executable
   if (!fs.existsSync(binary)) {
-    const error = new Error(`Ollama binary not found at ${binary}`)
-    logger.error(error)
-    throw error
+    throw new Error(`Ollama binary not found at ${binary}`)
   }
-
-  // Ensure binary is executable
+  
   try {
     fs.chmodSync(binary, 0o755)
   } catch (error) {
@@ -336,84 +490,79 @@ async function startServer(): Promise<ChildProcess> {
     throw error
   }
 
-  // Log binary info
-  try {
-    const stats = fs.statSync(binary)
-    logger.info('Binary stats:', {
-      size: stats.size,
-      mode: stats.mode,
-      uid: stats.uid,
-      gid: stats.gid
-    })
-  } catch (error) {
-    logger.error('Failed to get binary stats:', error)
-  }
-
-  const proc = spawn(binary, ['serve'], { 
+  // Start the server process
+  proc = spawn(binary, ['serve'], { 
     env,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe']
   })
 
   if (!proc.pid) {
-    const error = new Error('Failed to start server process')
-    logger.error(error)
-    throw error
+    throw new Error('Failed to start server process')
   }
 
   logger.info(`Server process started with PID: ${proc.pid}`)
 
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('Server startup timed out after 60 seconds'))
-    }, 60000)
+  let serverOutput = ''
+  let errorOutput = ''
 
-    let serverOutput = ''
-    let errorOutput = ''
-
-    proc.stdout.on('data', (data) => {
-      const output = data.toString()
-      serverOutput += output
-      logger.info('[Server]', output)
-      if (output.includes('Listening on')) {
-        clearTimeout(timeout)
-        resolve(proc)
-      }
-    })
-
-    proc.stderr.on('data', (data) => {
-      const output = data.toString()
-      errorOutput += output
-      // Some server messages come through stderr but aren't errors
-      if (output.includes('level=INFO') || output.includes('[GIN-debug]')) {
-        logger.info('[Server]', output)
-      } else {
-        logger.error('[Server Error]', output)
-      }
-    })
-
-    proc.on('error', (err) => {
-      clearTimeout(timeout)
-      logger.error('Server process error:', err)
-      logger.error('Server output:', serverOutput)
-      logger.error('Error output:', errorOutput)
-      reject(err)
-    })
-
-    proc.on('exit', (code, signal) => {
-      clearTimeout(timeout)
-      if (code !== 0) {
-        const error = new Error(`Server process exited with code ${code} and signal ${signal}`)
-        logger.error('Server process exit:', error)
-        logger.error('Server output:', serverOutput)
-        logger.error('Error output:', errorOutput)
-        reject(error)
-      }
-    })
+  proc.stdout.on('data', (data) => {
+    const output = data.toString()
+    serverOutput += output
+    logger.info('[Server Output]:', output)
   })
+
+  proc.stderr.on('data', (data) => {
+    const output = data.toString()
+    errorOutput += output
+    logger.error('[Server Error]:', output)
+  })
+
+  proc.on('error', (err) => {
+    logger.error('Server process error:', {
+      error: err,
+      stdout: serverOutput,
+      stderr: errorOutput
+    })
+    throw err
+  })
+
+  proc.on('exit', (code, signal) => {
+    if (code !== 0) {
+      const error = new Error(`Server process exited with code ${code} and signal ${signal}`)
+      logger.error('Server process exit:', {
+        error: error.message,
+        stdout: serverOutput,
+        stderr: errorOutput
+      })
+      throw error
+    }
+  })
+
+  // Wait for server port to be open
+  const isListening = await waitForPort(11434)
+  if (!isListening) {
+    proc.kill()
+    throw new Error('Server failed to start listening after 15 seconds')
+  }
+
+  return proc
 }
 
-function restart() {
-  setTimeout(startServer, 1000)
+async function restart() {
+  if (proc) {
+    logger.info('Stopping server for restart')
+    proc.kill()
+    await new Promise<void>((resolve) => {
+      proc.on('exit', () => {
+        proc = null
+        resolve()
+      })
+    })
+  }
+  
+  logger.info('Starting server after restart')
+  proc = await startServer()
+  updateTrayMenu()
 }
 
 async function isNewReleaseAvailable() {
