@@ -1,5 +1,5 @@
 import { spawn, ChildProcess } from 'child_process'
-import { app, autoUpdater, dialog, Tray, Menu, BrowserWindow, MenuItemConstructorOptions, nativeTheme } from 'electron'
+import { app, autoUpdater, dialog, Tray, Menu, BrowserWindow, MenuItemConstructorOptions, nativeTheme, shell, nativeImage } from 'electron'
 import Store from 'electron-store'
 import winston from 'winston'
 import 'winston-daily-rotate-file'
@@ -33,9 +33,120 @@ const logger = winston.createLogger({
   format: winston.format.printf((info: winston.Logform.TransformableInfo) => info.message as string),
 })
 
-app.on('ready', async () => {
+function createMenu() {
+  const isMac = process.platform === 'darwin'
+  
+  const template: MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [{
+          label: app.name,
+          submenu: [
+            { role: 'about' as const },
+            { type: 'separator' as const },
+            {
+              label: 'Check for Updates',
+              click: () => checkUpdate()
+            },
+            { type: 'separator' as const },
+            { role: 'services' as const },
+            { type: 'separator' as const },
+            { role: 'hide' as const },
+            { role: 'hideOthers' as const },
+            { role: 'unhide' as const },
+            { type: 'separator' as const },
+            { role: 'quit' as const }
+          ]
+        }]
+      : []),
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' as const },
+        { role: 'redo' as const },
+        { type: 'separator' as const },
+        { role: 'cut' as const },
+        { role: 'copy' as const },
+        { role: 'paste' as const },
+        ...(isMac
+          ? [
+              { role: 'pasteAndMatchStyle' as const },
+              { role: 'delete' as const },
+              { role: 'selectAll' as const },
+              { type: 'separator' as const },
+              {
+                label: 'Speech',
+                submenu: [
+                  { role: 'startSpeaking' as const },
+                  { role: 'stopSpeaking' as const }
+                ]
+              }
+            ]
+          : [
+              { role: 'delete' as const },
+              { type: 'separator' as const },
+              { role: 'selectAll' as const }
+            ])
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' as const },
+        { role: 'forceReload' as const },
+        { role: 'toggleDevTools' as const },
+        { type: 'separator' as const },
+        { role: 'resetZoom' as const },
+        { role: 'zoomIn' as const },
+        { role: 'zoomOut' as const },
+        { type: 'separator' as const },
+        { role: 'togglefullscreen' as const }
+      ]
+    },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' as const },
+        { role: 'zoom' as const },
+        ...(isMac
+          ? [
+              { type: 'separator' as const },
+              { role: 'front' as const },
+              { type: 'separator' as const },
+              { role: 'window' as const }
+            ]
+          : [
+              { role: 'close' as const }
+            ])
+      ]
+    }
+  ]
+
+  logger.info('Creating application menu with template:', JSON.stringify(template, null, 2))
+  const menu = Menu.buildFromTemplate(template)
+  Menu.setApplicationMenu(menu)
+  logger.info('Application menu created and set')
+}
+
+const updateURL = 'https://ollama.ai/download/app'
+
+app.setName('Ollama')
+
+// Disable hardware acceleration
+app.disableHardwareAcceleration()
+
+// Handle the 'will-finish-launching' event
+app.on('will-finish-launching', () => {
+  logger.info('App will finish launching')
+})
+
+let isQuitting = false
+
+app.whenReady().then(async () => {
+  logger.info('App is ready')
+  
   const gotTheLock = app.requestSingleInstanceLock()
   if (!gotTheLock) {
+    logger.info('Another instance is running, exiting')
     app.exit(0)
     return
   }
@@ -48,207 +159,263 @@ app.on('ready', async () => {
     app.exit(0)
   })
 
-  // Initialize server first
+  // Show dock icon
+  if (process.platform === 'darwin') {
+    logger.info('Showing dock icon')
+    app.dock.show()
+  }
+
+  // Create application menu
+  logger.info('Creating application menu')
+  createMenu()
+
+  // Initialize tray
+  logger.info('Initializing tray')
+  createTray()
+
+  // Initialize server
+  logger.info('Starting server initialization')
   try {
-    server()
+    await startServer()
+    logger.info('Server started successfully')
+
+    // Initialize app only after server is ready
+    logger.info('Initializing app')
+    init()
   } catch (error) {
     logger.error(`Failed to start server during initialization: ${error.message}`)
     dialog.showErrorBox('Server Error', `Failed to start Ollama server: ${error.message}`)
-    app.exit(1)
+    isQuitting = true
+    app.quit()
     return
   }
-
-  app.focus({ steal: true })
-  init()
 })
 
-function firstRunWindow() {
-  // Create the browser window.
-  welcomeWindow = new BrowserWindow({
-    width: 400,
-    height: 500,
-    frame: false,
-    fullscreenable: false,
-    resizable: false,
-    movable: true,
-    show: false,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-    },
-  })
+// Handle activation
+app.on('activate', () => {
+  logger.info('App activated')
+  if (process.platform === 'darwin') {
+    app.dock.show()
+  }
+})
 
-  require('@electron/remote/main').enable(welcomeWindow.webContents)
+// Handle window-all-closed
+app.on('window-all-closed', () => {
+  logger.info('All windows closed')
+  if (process.platform !== 'darwin' || isQuitting) {
+    app.quit()
+  }
+})
 
-  welcomeWindow.loadURL(MAIN_WINDOW_WEBPACK_ENTRY)
-  welcomeWindow.on('ready-to-show', () => welcomeWindow.show())
-  welcomeWindow.on('closed', () => {
-    if (process.platform === 'darwin') {
-      app.dock.hide()
-    }
-  })
-}
+// Handle before-quit
+app.on('before-quit', () => {
+  logger.info('App is quitting')
+  isQuitting = true
+  if (proc) {
+    proc.off('exit', restart)
+    proc.kill('SIGINT')
+  }
+})
 
 let tray: Tray | null = null
 let updateAvailable = false
 const assetPath = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', '..', 'assets')
 
-function trayIconPath() {
-  return nativeTheme.shouldUseDarkColors
-    ? updateAvailable
-      ? path.join(assetPath, 'iconDarkUpdateTemplate.png')
-      : path.join(assetPath, 'iconDarkTemplate.png')
-    : updateAvailable
-    ? path.join(assetPath, 'iconUpdateTemplate.png')
-    : path.join(assetPath, 'iconTemplate.png')
-}
+function createTray() {
+  logger.info('Initializing tray')
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'iconDarkTemplate.png')
+    : path.join(__dirname, '../assets/iconDarkTemplate.png')
 
-function updateTrayIcon() {
-  if (tray) {
-    tray.setImage(trayIconPath())
+  logger.info(`Using tray icon: ${iconPath}`)
+  
+  try {
+    if (!fs.existsSync(iconPath)) {
+      logger.error(`Tray icon not found at ${iconPath}`)
+      const lightIconPath = app.isPackaged
+        ? path.join(process.resourcesPath, 'iconTemplate.png')
+        : path.join(__dirname, '../assets/iconTemplate.png')
+        
+      if (fs.existsSync(lightIconPath)) {
+        logger.info(`Using light tray icon instead: ${lightIconPath}`)
+        tray = new Tray(nativeImage.createFromPath(lightIconPath))
+      } else {
+        logger.error('No tray icons found')
+        throw new Error('No tray icons found')
+      }
+    } else {
+      tray = new Tray(nativeImage.createFromPath(iconPath))
+    }
+
+    tray.setToolTip('Ollama')
+    updateTrayMenu()
+  } catch (error) {
+    logger.error('Failed to create tray:', error)
+    app.dock.show()
   }
 }
 
-function updateTray() {
-  const updateItems: MenuItemConstructorOptions[] = [
-    { label: 'An update is available', enabled: false },
+function updateTrayMenu() {
+  const contextMenu = Menu.buildFromTemplate([
     {
-      label: 'Restart to update',
-      click: () => autoUpdater.quitAndInstall(),
+      label: 'Ollama',
+      enabled: false,
     },
-    { type: 'separator' },
-  ]
-
-  const menu = Menu.buildFromTemplate([
-    ...(updateAvailable ? updateItems : []),
-    { role: 'quit', label: 'Quit Ollama', accelerator: 'Command+Q' },
+    { type: 'separator' as const },
+    {
+      label: updateAvailable ? 'Update Available' : 'Check for Updates',
+      click: () => {
+        if (updateAvailable) {
+          shell.openExternal(updateURL)
+        } else {
+          checkUpdate()
+        }
+      },
+    },
+    { type: 'separator' as const },
+    {
+      label: 'Quit',
+      click: () => {
+        isQuitting = true
+        app.quit()
+      },
+    },
   ])
 
-  if (!tray) {
-    tray = new Tray(trayIconPath())
-  }
-
-  tray.setToolTip(updateAvailable ? 'An update is available' : 'Ollama')
-  tray.setContextMenu(menu)
-  tray.setImage(trayIconPath())
-
-  nativeTheme.off('updated', updateTrayIcon)
-  nativeTheme.on('updated', updateTrayIcon)
+  tray.setContextMenu(contextMenu)
 }
 
 let proc: ChildProcess = null
 
-function server() {
+async function startServer(): Promise<ChildProcess> {
+  logger.info('Starting server initialization')
+  
+  // Ensure ollama directories exist
+  const ollamaDir = path.join(app.getPath('home'), '.ollama')
+  const modelsDir = path.join(ollamaDir, 'models')
+  
+  try {
+    if (!fs.existsSync(ollamaDir)) {
+      fs.mkdirSync(ollamaDir, { recursive: true, mode: 0o755 })
+    }
+    if (!fs.existsSync(modelsDir)) {
+      fs.mkdirSync(modelsDir, { recursive: true, mode: 0o755 })
+    }
+  } catch (error) {
+    logger.error('Failed to create ollama directories:', error)
+    throw error
+  }
+
+  const env = { ...process.env }
+  env.OLLAMA_MODELS = modelsDir
+  env.OLLAMA_ORIGINS = '*'
+  env.OLLAMA_HOST = 'http://127.0.0.1:11434'
+  env.PATH = process.env.PATH || '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+  env.HOME = app.getPath('home')
+
   const binary = app.isPackaged
     ? path.join(process.resourcesPath, 'ollama')
     : path.resolve(process.cwd(), '..', 'ollama')
 
   logger.info(`Starting ollama server with binary: ${binary}`)
   logger.info(`Current working directory: ${process.cwd()}`)
+  logger.info('Starting server with environment:', JSON.stringify(env, null, 2))
 
-  // Verify binary exists
+  // Ensure binary exists
   if (!fs.existsSync(binary)) {
-    throw new Error(`Ollama binary not found at ${binary}`)
-  }
-
-  // Ensure the .ollama directory exists with proper permissions
-  const ollamaDir = path.join(app.getPath('home'), '.ollama')
-  const modelsDir = path.join(ollamaDir, 'models')
-  const logsDir = path.join(ollamaDir, 'logs')
-
-  try {
-    // Create all necessary directories
-    for (const dir of [ollamaDir, modelsDir, logsDir]) {
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o755 })
-      } else {
-        fs.chmodSync(dir, 0o755)
-      }
-    }
-  } catch (error) {
-    logger.error(`Failed to setup ollama directories: ${error.message}`)
+    const error = new Error(`Ollama binary not found at ${binary}`)
+    logger.error(error)
     throw error
   }
 
-  // Set environment variables
-  const env = {
-    ...process.env,
-    OLLAMA_MODELS: modelsDir,
-    OLLAMA_ORIGINS: '*',
-    OLLAMA_HOST: 'http://127.0.0.1:11434',
-    PATH: process.env.PATH,
-    HOME: app.getPath('home')
-  }
-
-  logger.info(`Environment variables: ${JSON.stringify(env, null, 2)}`)
-
-  // Ensure the binary is executable
+  // Ensure binary is executable
   try {
     fs.chmodSync(binary, 0o755)
   } catch (error) {
-    logger.error(`Failed to set binary permissions: ${error.message}`)
+    logger.error('Failed to set binary permissions:', error)
     throw error
   }
 
-  proc = spawn(binary, ['serve'], { 
+  // Log binary info
+  try {
+    const stats = fs.statSync(binary)
+    logger.info('Binary stats:', {
+      size: stats.size,
+      mode: stats.mode,
+      uid: stats.uid,
+      gid: stats.gid
+    })
+  } catch (error) {
+    logger.error('Failed to get binary stats:', error)
+  }
+
+  const proc = spawn(binary, ['serve'], { 
     env,
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
   if (!proc.pid) {
-    throw new Error('Failed to start server process')
+    const error = new Error('Failed to start server process')
+    logger.error(error)
+    throw error
   }
 
   logger.info(`Server process started with PID: ${proc.pid}`)
 
-  proc.stdout.on('data', data => {
-    logger.info(`[stdout] ${data.toString().trim()}`)
-  })
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('Server startup timed out after 60 seconds'))
+    }, 60000)
 
-  proc.stderr.on('data', data => {
-    logger.error(`[stderr] ${data.toString().trim()}`)
-  })
+    let serverOutput = ''
+    let errorOutput = ''
 
-  proc.on('error', (err) => {
-    logger.error(`Failed to start server: ${err.message}`)
-    if (err.message.includes('EACCES')) {
-      logger.error('Permission denied. Please check file permissions.')
-      throw err
-    }
-  })
+    proc.stdout.on('data', (data) => {
+      const output = data.toString()
+      serverOutput += output
+      logger.info('[Server]', output)
+      if (output.includes('Listening on')) {
+        clearTimeout(timeout)
+        resolve(proc)
+      }
+    })
 
-  proc.on('exit', (code, signal) => {
-    logger.info(`Server process exited with code ${code} and signal ${signal}`)
-    if (code !== 0 && signal !== 'SIGTERM' && signal !== 'SIGINT') {
-      logger.error('Server exited unexpectedly')
-      restart()
-    }
-  })
+    proc.stderr.on('data', (data) => {
+      const output = data.toString()
+      errorOutput += output
+      // Some server messages come through stderr but aren't errors
+      if (output.includes('level=INFO') || output.includes('[GIN-debug]')) {
+        logger.info('[Server]', output)
+      } else {
+        logger.error('[Server Error]', output)
+      }
+    })
 
-  // Add a cleanup handler
-  process.on('exit', () => {
-    if (proc) {
-      proc.kill('SIGINT')
-    }
+    proc.on('error', (err) => {
+      clearTimeout(timeout)
+      logger.error('Server process error:', err)
+      logger.error('Server output:', serverOutput)
+      logger.error('Error output:', errorOutput)
+      reject(err)
+    })
+
+    proc.on('exit', (code, signal) => {
+      clearTimeout(timeout)
+      if (code !== 0) {
+        const error = new Error(`Server process exited with code ${code} and signal ${signal}`)
+        logger.error('Server process exit:', error)
+        logger.error('Server output:', serverOutput)
+        logger.error('Error output:', errorOutput)
+        reject(error)
+      }
+    })
   })
 }
 
 function restart() {
-  setTimeout(server, 1000)
+  setTimeout(startServer, 1000)
 }
 
-app.on('before-quit', () => {
-  if (proc) {
-    proc.off('exit', restart)
-    proc.kill('SIGINT') // send SIGINT signal to the server, which also stops any loaded llms
-  }
-})
-
-const updateURL = `https://ollama.com/api/update?os=${process.platform}&arch=${
-  process.arch
-}&version=${app.getVersion()}&id=${id()}`
-
-let latest = ''
 async function isNewReleaseAvailable() {
   try {
     const response = await fetch(updateURL)
@@ -296,8 +463,6 @@ function init() {
       checkUpdate()
     }, 60 * 60 * 1000)
   }
-
-  updateTray()
 
   if (process.platform === 'darwin') {
     if (app.isPackaged) {
@@ -348,13 +513,44 @@ function init() {
   firstRunWindow()
 }
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+function firstRunWindow() {
+  // Create the browser window.
+  welcomeWindow = new BrowserWindow({
+    width: 400,
+    height: 500,
+    frame: false,
+    fullscreenable: false,
+    resizable: false,
+    movable: true,
+    show: false,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+    },
+  })
+
+  require('@electron/remote/main').enable(welcomeWindow.webContents)
+
+  welcomeWindow.loadURL(MAIN_WINDOW_WEBPACK_ENTRY)
+  welcomeWindow.on('ready-to-show', () => welcomeWindow.show())
+  welcomeWindow.on('closed', () => {
+    if (process.platform === 'darwin') {
+      app.dock.hide()
+    }
+  })
+}
+
+let latest = ''
+autoUpdater.setFeedURL({ url: updateURL })
+
+autoUpdater.on('error', e => {
+  logger.error(`update check failed - ${e.message}`)
+  console.error(`update check failed - ${e.message}`)
+})
+
+autoUpdater.on('update-downloaded', () => {
+  updateAvailable = true
+  updateTrayMenu()
 })
 
 function id(): string {
@@ -368,15 +564,3 @@ function id(): string {
   store.set('id', uuid)
   return uuid
 }
-
-autoUpdater.setFeedURL({ url: updateURL })
-
-autoUpdater.on('error', e => {
-  logger.error(`update check failed - ${e.message}`)
-  console.error(`update check failed - ${e.message}`)
-})
-
-autoUpdater.on('update-downloaded', () => {
-  updateAvailable = true
-  updateTray()
-})

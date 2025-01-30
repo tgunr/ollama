@@ -2,27 +2,40 @@ const { AutoUnpackNativesPlugin } = require('@electron-forge/plugin-auto-unpack-
 const { WebpackPlugin } = require('@electron-forge/plugin-webpack');
 const path = require('path');
 const fs = require('fs');
+const packageJson = require('./package.json');
 
-const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, './package.json'), 'utf8'));
-
-// Note: These configs might need to be adjusted if they use ES modules
 const mainConfig = require('./webpack.main.config');
 const rendererConfig = require('./webpack.renderer.config');
 
 module.exports = {
   packagerConfig: {
     name: 'Ollama',
+    executableName: 'Ollama',
     appVersion: process.env.VERSION || packageJson.version,
-    asar: true,
-    icon: './assets/icon',
+    icon: path.resolve(__dirname, 'assets/icon.icns'),
+    asar: {
+      unpack: '*.{node,dll}'
+    },
     extraResource: [
-      path.resolve(__dirname, '../ollama')
+      path.resolve(__dirname, '../ollama'),
+      path.resolve(__dirname, 'assets/iconTemplate.png'),
+      path.resolve(__dirname, 'assets/iconTemplate@2x.png'),
+      path.resolve(__dirname, 'assets/iconDarkTemplate.png'),
+      path.resolve(__dirname, 'assets/iconDarkTemplate@2x.png'),
+      path.resolve(__dirname, 'assets/iconUpdateTemplate.png'),
+      path.resolve(__dirname, 'assets/iconUpdateTemplate@2x.png'),
+      path.resolve(__dirname, 'assets/iconDarkUpdateTemplate.png'),
+      path.resolve(__dirname, 'assets/iconDarkUpdateTemplate@2x.png')
     ],
+    appBundleId: 'com.ollama.app',
     osxSign: {
-      entitlements: 'entitlements.plist',
-      'entitlements-inherit': 'entitlements.plist',
+      identity: process.env.APPLE_IDENTITY,
+      'hardened-runtime': true,
       'gatekeeper-assess': false,
       hardenedRuntime: true,
+      entitlements: 'entitlements.plist',
+      'entitlements-inherit': 'entitlements.plist',
+      'signature-flags': 'library'
     },
     arch: 'arm64',
     platform: 'darwin',
@@ -39,6 +52,7 @@ module.exports = {
       name: '@electron-forge/maker-zip',
       platforms: ['darwin'],
       config: {
+        name: 'Ollama',
         arch: 'arm64'
       }
     }
@@ -55,24 +69,11 @@ module.exports = {
             js: './src/renderer.tsx',
             name: 'main_window',
             preload: {
-              js: './src/preload.ts'
-            }
-          }
-        ]
-      }
-    })
-  ],
-  publishers: [
-    {
-      name: '@electron-forge/publisher-github',
-      config: {
-        repository: {
-          owner: 'jmorganca',
-          name: 'ollama',
-        },
-        prerelease: false,
-        draft: true,
+              js: './src/preload.ts',
+            },
+          },
+        ],
       },
-    },
+    }),
   ],
 };
